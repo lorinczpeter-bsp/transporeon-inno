@@ -155,9 +155,30 @@ def normalize_zip(value, country):
     return compact
 
 
+def exact_zip_matches(description, postal, country):
+    """Match complete postal codes in lists, without padding short area prefixes.
+
+    Numeric ranges must not become exact ZIPs when punctuation is removed:
+    e.g. Austrian 10-19 is a range, not the complete postal code 1019.
+    Polish 05-311 is a complete postal code, as are spaced codes such as 48 000.
+    """
+    for part in re.split(r'[,;]', text(description).upper()):
+        token = part.strip().replace('–', '-').replace('—', '-')
+        token = re.sub(r'^' + re.escape(country) + r'\s*-\s*', '', token)
+        if '-' in token and not (country == 'PL' and re.fullmatch(r'\d{2}-\d{3}', token)):
+            continue
+        if not re.fullmatch(r'[A-Z0-9\s-]+', token):
+            continue
+        if re.sub(r'[\s-]', '', token) == postal:
+            return True
+    return False
+
+
 def zip_matches(description, postal, country):
     """ZIP prefixes and inclusive ranges; unknown patterns never get guessed."""
     raw = text(description).upper().replace('–', '-').replace('—', '-')
+    if exact_zip_matches(raw, postal, country):
+        return True
     if raw.startswith('ALL ZIP'):
         return True
     for part in re.split(r'[,;]', raw):
@@ -288,11 +309,13 @@ def fetch_google(url, credentials=None):
 
 def candidate_routes(routes, rates, loading, country, postal):
     available = {key[2] for key in rates if key[0] == loading and key[1] == country}
-    matching = {r['route'] for r in routes if zip_matches(r['description'], postal, country)}
-    # Confirmed exception: Dutch 7030 uses NL161B, ahead of NL161's all-ZIP rule.
-    # If the specific tariff is missing, do not silently charge the general route.
-    if country == 'NL' and postal == '7030':
-        matching = {'NL161B'} if 'NL161B' in matching else set()
+    base_routes = {code.split(' [')[0] for code in available}
+    applicable = [r for r in routes if r['route'] in base_routes or r['route'].startswith(country)]
+    exact = {r['route'] for r in applicable if exact_zip_matches(r['description'], postal, country)}
+    # A complete ZIP always wins over a region/prefix or an all-ZIP rule.
+    # Do not silently use a regional tariff if the exact route has no tariff.
+    matching = exact if exact else {r['route'] for r in applicable
+                                  if zip_matches(r['description'], postal, country)}
     return sorted(code for code in available if code.split(' [')[0] in matching)
 
 
@@ -471,30 +494,45 @@ def main():
         st.header('Forrásfájlok')
         source = st.file_uploader('1. Transporeon-export', type=['xlsx'], key='source')
         st.subheader('2. Aktuális fuvardíjak')
-        uploaded_rates = st.file_uploader('Google-díjtábla XLSX-változata', type=['xlsx'],
-                                         help='A Hartmann fuvardíjak táblázatból letöltött Excel, Rates munkalappal.')
-        with st.expander('Google Sheets-kapcsolat', expanded=uploaded_rates is None):
-            url = st.text_input('Díjtáblázat hivatkozása', value=GOOGLE_URL)
-            fetch = st.button('Díjtábla betöltése / frissítése')
-            st.caption('Zárt táblázathoz Google-szolgáltatásfiók állítható be a Streamlit Secretsben. Enélkül töltsd fel az XLSX-et; megosztást nem kell módosítani.')
+        uploaded_rates = None
+        with st.expander('Google Sheets-kapcsolat', expanded=True):
+            url = st.text_input('Díjtáblázat hivatkozása', value=GOOGLE_URL, key='google_url')
+            fetch = st.button('Díjtábla frissítése', key='google_refresh')
+            # Attempt once at session startup, on URL change, or explicit refresh.
+            # Ordinary edits and filters reuse this session's successful read.
+            if st.session_state.get('google_attempted_url') != url or fetch:
+                st.session_state['google_attempted_url'] = url
+                st.session_state.pop('live_rates', None)
+                st.session_state.pop('google_error', None)
+                try:
+                    with st.spinner('Google-díjtábla betöltése…'):
+                        try:
+                            credentials = st.secrets.get('google_service_account')
+                        except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+                            credentials = None
+                        google_values = fetch_google(url, credentials)
+                        _, header, column = parse_rates(google_values)
+                        st.session_state['live_rates'] = {
+                            'values': google_values, 'url': url,
+                            'at': datetime.now().isoformat(timespec='seconds'),
+                            'price_header': header, 'price_column': column}
+                except Exception:
+                    st.session_state['google_error'] = 'Nem sikerült a Google-díjtábla beolvasása.'
+            live = st.session_state.get('live_rates', {})
+            if live.get('url') == url and not st.session_state.get('google_error'):
+                st.success('Google-díjtábla betöltve.')
+                st.caption('Használt ároszlop: ' + live['price_column'] + ' – ' + live['price_header'])
+            else:
+                st.warning('Nem sikerült a Google-díjtábla beolvasása. Próbáld újra a frissítést, vagy töltsd fel az XLSX-változatát.')
+                uploaded_rates = st.file_uploader('Google-díjtábla XLSX-változata', type=['xlsx'],
+                    key='fallback_rates:' + hashlib.sha256(url.encode()).hexdigest()[:12],
+                    help='A Hartmann fuvardíjak táblázatból letöltött Excel, Rates munkalappal.')
+                st.caption('Zárt táblázathoz olvasási hozzáférésű Google-szolgáltatásfiók állítható be a Streamlit Secretsben.')
         with st.expander('Útvonalak és importsablon'):
             route_upload = st.file_uploader('Új Final External ratesheet (opcionális)', type=['xlsx'])
             st.caption('Alapértelmezés: a megadott 2026-os fájl Routes Overview (Road) adatai.')
             template_upload = st.file_uploader('Másik InnoTMS-importminta (opcionális)', type=['xlsx'])
             st.caption('Az eredeti importminta fejlécei és rejtett TP-Meta lapja be vannak építve.')
-    if fetch:
-        try:
-            with st.spinner('Díjtábla olvasása…'):
-                try:
-                    credentials = st.secrets.get('google_service_account')
-                except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
-                    credentials = None
-                values = fetch_google(url, credentials)
-                parse_rates(values)
-                st.session_state['live_rates'] = {'values': values, 'url': url, 'at': datetime.now().isoformat(timespec='seconds')}
-        except Exception:
-            st.session_state.pop('live_rates', None)
-            st.error('Nem sikerült a Google-díjtábla beolvasása. Ellenőrizd a szolgáltatásfiók hozzáférését, vagy töltsd fel a táblázat XLSX-változatát.')
     try:
         if uploaded_rates is not None:
             rate_bytes = uploaded_rates.getvalue()
@@ -509,7 +547,10 @@ def main():
         else:
             values = None
         if not source or values is None:
-            st.info('Töltsd fel a Transporeon-exportot, majd töltsd be a díjtáblát a bal oldalon.')
+            if not source:
+                st.info('Töltsd fel a Transporeon-exportot a bal oldalon.')
+            else:
+                st.info('A Google-kapcsolat hibáját javítsd a frissítéssel, vagy töltsd fel a díjtábla XLSX-változatát a bal oldalon.')
             st.markdown('**A feldolgozás menete**\n\n1. Fuvarszám szerinti összevonás.\n2. Dátum- és útvonaleltérések rendezése.\n3. Fuvardíjak ellenőrzése és az importfájl letöltése.')
             return
         source_bytes = source.getvalue()
