@@ -4,6 +4,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import zipfile
+import xml.etree.ElementTree as ET
+from copy import deepcopy
 import json
 import re
 from collections import defaultdict
@@ -498,6 +501,69 @@ def render_brand():
     st.caption('Válassz időszakot, ellenőrizd a fuvarokat, majd töltsd le az InnoTMS-importot.')
 
 
+def use_shared_strings(data):
+    """Store Excel text in sharedStrings, matching the accepted InnoTMS sample."""
+    main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    rel_ns = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    types_ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    rel_type = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings'
+    with zipfile.ZipFile(io.BytesIO(data)) as source:
+        parts = {name: source.read(name) for name in source.namelist()}
+    table = ET.fromstring(parts['xl/sharedStrings.xml']) if 'xl/sharedStrings.xml' in parts else ET.Element(f'{{{main}}}sst')
+    indices = {ET.tostring(item): i for i, item in enumerate(table)}
+    count = 0
+    ET.register_namespace('', main)
+    for name in list(parts):
+        if not name.startswith('xl/worksheets/') or not name.endswith('.xml'):
+            continue
+        root = ET.fromstring(parts[name])
+        changed = False
+        for cell in root.iter(f'{{{main}}}c'):
+            if cell.get('t') == 'inlineStr':
+                inline = cell.find(f'{{{main}}}is')
+                if inline is None:
+                    continue
+                item = ET.Element(f'{{{main}}}si')
+                for child in inline:
+                    item.append(deepcopy(child))
+                key = ET.tostring(item)
+                if key not in indices:
+                    indices[key] = len(table)
+                    table.append(item)
+                cell.remove(inline)
+                cell.set('t', 's')
+                ET.SubElement(cell, f'{{{main}}}v').text = str(indices[key])
+                changed = True
+            if cell.get('t') == 's':
+                count += 1
+        if changed:
+            parts[name] = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+    table.set('count', str(count))
+    table.set('uniqueCount', str(len(table)))
+    parts['xl/sharedStrings.xml'] = ET.tostring(table, encoding='utf-8', xml_declaration=True)
+    relations = ET.fromstring(parts['xl/_rels/workbook.xml.rels'])
+    if not any(r.get('Type') == rel_type for r in relations):
+        used = {r.get('Id') for r in relations}
+        index = 1
+        while f'rId{index}' in used:
+            index += 1
+        ET.SubElement(relations, f'{{{rel_ns}}}Relationship',
+                      Id=f'rId{index}', Type=rel_type, Target='sharedStrings.xml')
+    ET.register_namespace('', rel_ns)
+    parts['xl/_rels/workbook.xml.rels'] = ET.tostring(relations, encoding='utf-8', xml_declaration=True)
+    types = ET.fromstring(parts['[Content_Types].xml'])
+    if not any(t.get('PartName') == '/xl/sharedStrings.xml' for t in types):
+        ET.SubElement(types, f'{{{types_ns}}}Override', PartName='/xl/sharedStrings.xml',
+                      ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml')
+    ET.register_namespace('', types_ns)
+    parts['[Content_Types].xml'] = ET.tostring(types, encoding='utf-8', xml_declaration=True)
+    result = io.BytesIO()
+    with zipfile.ZipFile(result, 'w', zipfile.ZIP_DEFLATED) as output:
+        for name, content in parts.items():
+            output.writestr(name, content)
+    return result.getvalue()
+
+
 def create_export(template, records):
     """Preserve the supplied 30 columns, duplicate Weight header and hidden TP-Meta."""
     book = openpyxl.load_workbook(io.BytesIO(template))
@@ -509,7 +575,7 @@ def create_export(template, records):
     sample_height = sheet.row_dimensions[2].height if 2 in sheet.row_dimensions else None
     if sheet.max_row > 1:
         sheet.delete_rows(2, sheet.max_row - 1)
-    for rec in records:
+    for row_index, rec in enumerate(records, start=2):
         r, g = rec['source'], rec['group']
         loading_date, unloading_date = rec['loading_date'], rec['unloading_date']
         t0, t1 = timestamp(r.get(DATE_FIELDS[2])), timestamp(r.get(DATE_FIELDS[3]))
@@ -527,18 +593,19 @@ def create_export(template, records):
                   text(r.get('Cég neve - Berakodási hely')), text(r.get('Postai irányítószám - Berakodási hely')),
                   text(r.get('Város - Berakodási hely')), text(r.get('Ország - Berakodási hely')),
                   float(rec['price'])]
-        sheet.append(values)
+
         # Treat source text literally, including strings beginning with '='.
-        for cell, value, style in zip(sheet[sheet.max_row], values, row_styles):
+        for column, (value, style) in enumerate(zip(values, row_styles), start=1):
+            cell = sheet.cell(row_index, column, value)
             cell._style = copy(style)
             if isinstance(value, str):
                 cell.data_type = 's'
         if sample_height is not None:
-            sheet.row_dimensions[sheet.max_row].height = sample_height
+            sheet.row_dimensions[row_index].height = sample_height
     out = io.BytesIO()
     book.save(out)
     book.close()
-    return out.getvalue()
+    return use_shared_strings(out.getvalue())
 
 
 def remember_table_edits(editor_key, override_key, ids):
@@ -598,8 +665,10 @@ def main():
     try:
         if uploaded_rates is not None:
             rate_bytes = uploaded_rates.getvalue()
-            values = read_rate_xlsx(rate_bytes)
             rate_identity = hashlib.sha256(rate_bytes).hexdigest()
+            if st.session_state.get('uploaded_rate_cache', {}).get('digest') != rate_identity:
+                st.session_state['uploaded_rate_cache'] = {'digest': rate_identity, 'values': read_rate_xlsx(rate_bytes)}
+            values = st.session_state['uploaded_rate_cache']['values']
             origin = f'Feltöltött díjtábla: {uploaded_rates.name}'
         elif st.session_state.get('live_rates', {}).get('url') == url:
             live = st.session_state['live_rates']
@@ -621,10 +690,11 @@ def main():
         # Keep uploaded business data in this user's session, not a shared cache.
         context = hashlib.sha256(DATA_SCHEMA.encode() + source_bytes + (route_bytes or b'') + template_bytes + rate_identity.encode()).hexdigest()[:16]
         if st.session_state.get('context') != context:
+            prepared = aggregate(source_bytes)
+            routes = read_routes(route_bytes)
+            parsed_rates = parse_rates(values)
+            st.session_state.update(prepared=prepared, routes=routes, rates=parsed_rates)
             st.session_state['context'] = context
-            st.session_state['prepared'] = aggregate(source_bytes)
-            st.session_state['routes'] = read_routes(route_bytes)
-            st.session_state['rates'] = parse_rates(values)
         groups, count, _ = st.session_state['prepared']
         routes = st.session_state['routes']
         rates, price_header, price_column = st.session_state['rates']
