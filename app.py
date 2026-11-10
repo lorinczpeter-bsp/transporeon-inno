@@ -929,7 +929,8 @@ def main():
                 price_errors.append(str(exc))
         records[g['id']] = {'source': r, 'group': g, 'price': price, 'route': route,
                             'errors': errors, 'price_errors': price_errors, 'band': band}
-        rows.append({'Import': True, 'Fuvar sz.': g['id'], 'Címzett': text(r.get('Cég neve - Kirakodási hely')),
+        rows.append({'Megbízó további számai': g['customer_reference'],
+                     'Import': True, 'Fuvar sz.': g['id'], 'Címzett': text(r.get('Cég neve - Kirakodási hely')),
                      'Ország': country, 'Irányítószám': postal, 'Város': text(r.get('Város - Kirakodási hely')),
                      'Berakodás': selected_dates['Berakodás'], 'Kirakodás': selected_dates['Kirakodás'],
                      'Súly (kg)': float(g['sums']['Súly']) if g['sums']['Súly'] is not None else None,
@@ -937,7 +938,7 @@ def main():
                      'Szállítmányok': len(g['rows']), 'Útvonal': route or '',
                      'Díjsáv': band['band'] if band else '', 'Fuvardíj (EUR)': float(price) if price is not None else None,
                      'Kézi fuvardíj (EUR)': None,
-                     'Megbízó további számai': g['customer_reference'], 'Jelzés': ' · '.join(errors + price_errors)})
+                     'Jelzés': ' · '.join(errors + price_errors)})
     st.subheader('Fuvarlista ellenőrzése')
     st.caption('Az Import jelöléssel választhatod ki a feltöltendő fuvarokat. A dátumok szerkeszthetők. A megbízói számok az Odaítélt fuvarok exportból érkeznek. A pirossal kiemelt fuvaroknál még teendő van. Ha nincs automatikus ár, add meg a kézi fuvardíjat. Ez az összeg kerül az exportba.')
     frame = pd.DataFrame(rows)
