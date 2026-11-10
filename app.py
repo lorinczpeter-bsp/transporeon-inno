@@ -929,8 +929,8 @@ def main():
                 price_errors.append(str(exc))
         records[g['id']] = {'source': r, 'group': g, 'price': price, 'route': route,
                             'errors': errors, 'price_errors': price_errors, 'band': band}
-        rows.append({'Megbízó további számai': g['customer_reference'],
-                     'Import': True, 'Fuvar sz.': g['id'], 'Címzett': text(r.get('Cég neve - Kirakodási hely')),
+        rows.append({'Import': True, 'Megbízó további számai': g['customer_reference'],
+                     'Fuvar sz.': g['id'], 'Címzett': text(r.get('Cég neve - Kirakodási hely')),
                      'Ország': country, 'Irányítószám': postal, 'Város': text(r.get('Város - Kirakodási hely')),
                      'Berakodás': selected_dates['Berakodás'], 'Kirakodás': selected_dates['Kirakodás'],
                      'Súly (kg)': float(g['sums']['Súly']) if g['sums']['Súly'] is not None else None,
